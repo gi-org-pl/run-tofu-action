@@ -1,0 +1,91 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Plan the example configuration
+        uses: ./
+        with:
+          command: plan
+          working-directory: test/e2e
+          backend-config: ''
+
+  apply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the example configuration
+        uses: ./
+        with:
+          command: apply
+          working-directory: test/e2e
+          backend-config: ''
+          comment: 'false'
+      - name: Check that the state has the resource
+        working-directory: test/e2e
+        run: tofu state list | grep -qx terraform_data.example
+
+  drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check an empty configuration for drift
+        uses: ./
+        with:
+          command: drift
+          working-directory: test/empty
+          backend-config: ''
+          comment: 'false'
+          drift-check: touch drift-check-ran
+      - name: Check that the drift check ran
+        run: test -f drift-check-ran
+
+  drift-found:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check a configuration with changes for drift
+        id: drift
+        continue-on-error: true
+        uses: ./
+        with:
+          command: drift
+          working-directory: test/e2e
+          backend-config: ''
+          comment: 'false'
+          drift-check: touch drift-check-ran
+      - name: Check that drift failed and the drift check still ran
+        env:
+          OUTCOME: ${{ steps.drift.outcome }}
+        run: |
+          test "$OUTCOME" = failure
+          test -f drift-check-ran

@@ -1,0 +1,140 @@
+name: Run OpenTofu
+description: Plans, applies or checks for drift in an OpenTofu configuration, and reports the plan
+author: gi-org-pl
+
+inputs:
+  command:
+    description: '`plan` (fmt, validate and plan), `apply` (plan, then apply that plan) or `drift` (plan that fails when anything would change)'
+    required: true
+  working-directory:
+    description: Directory of the OpenTofu root module, relative to the repository root
+    required: false
+    default: infra
+  backend-config:
+    description: Backend settings file passed to `tofu init`, relative to working-directory; empty for none
+    required: false
+    default: backend.hcl
+  aws-role-arn:
+    description: AWS role assumed through GitHub OIDC, for the state bucket and the AWS provider; empty to skip
+    required: false
+    default: ''
+  aws-region:
+    description: AWS region of the role session
+    required: false
+    default: eu-central-1
+  github-app-client-id:
+    description: Client ID of a GitHub App whose installation token OpenTofu gets as `GITHUB_TOKEN`; empty to skip
+    required: false
+    default: ''
+  github-app-private-key:
+    description: Private key of that GitHub App
+    required: false
+    default: ''
+  drift-check:
+    description: Shell command run from the repository root after a drift plan, even when the plan found changes, to look for resources created outside OpenTofu
+    required: false
+    default: ''
+  tofu-version:
+    description: OpenTofu version
+    required: false
+    default: 1.13.9
+  comment:
+    description: Whether to comment the plan on pull requests
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Check the command
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+      run: |
+        case "$COMMAND" in
+          plan | apply | drift) ;;
+          *) echo "::error::command must be plan, apply or drift, not '$COMMAND'"; exit 1 ;;
+        esac
+
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Configure AWS credentials
+      if: inputs.aws-role-arn != ''
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Create GitHub App token
+      id: app-token
+      if: inputs.github-app-client-id != ''
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ inputs.github-app-client-id }}
+        private-key: ${{ inputs.github-app-private-key }}
+        owner: ${{ github.repository_owner }}
+
+    - name: Set up OpenTofu
+      uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+      with:
+        tofu_version: ${{ inputs.tofu-version }}
+        tofu_wrapper: false
+
+    - name: Check formatting
+      if: inputs.command == 'plan'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: tofu fmt -check -recursive -diff
+
+    - name: Initialize OpenTofu
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BACKEND_CONFIG: ${{ inputs.backend-config }}
+      run: tofu init -input=false ${BACKEND_CONFIG:+"-backend-config=$BACKEND_CONFIG"}
+
+    - name: Validate
+      if: inputs.command == 'plan'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: tofu validate
+
+    - name: Plan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COMMAND: ${{ inputs.command }}
+        GITHUB_TOKEN: ${{ steps.app-token.outputs.token || env.GITHUB_TOKEN }}
+      run: |
+        if [ "$COMMAND" = drift ]; then
+          tofu plan -input=false -lock-timeout=10m -detailed-exitcode -out=tfplan
+        else
+          tofu plan -input=false -lock-timeout=10m -out=tfplan
+        fi
+
+    - name: Report the plan
+      if: always()
+      uses: gi-org-pl/report-tofu-plan-action@3e9723344bbd1c09659e14bf34be192d8db84213 # v1.0.1
+      with:
+        working-directory: ${{ inputs.working-directory }}
+        comment: ${{ inputs.comment }}
+
+    - name: Apply
+      if: inputs.command == 'apply'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GITHUB_TOKEN: ${{ steps.app-token.outputs.token || env.GITHUB_TOKEN }}
+      run: tofu apply -input=false -lock-timeout=10m tfplan
+
+    - name: Look for resources created outside OpenTofu
+      if: always() && inputs.command == 'drift' && inputs.drift-check != ''
+      shell: bash
+      env:
+        DRIFT_CHECK: ${{ inputs.drift-check }}
+        GITHUB_TOKEN: ${{ steps.app-token.outputs.token || env.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ steps.app-token.outputs.token || env.GH_TOKEN }}
+      run: eval "$DRIFT_CHECK"
